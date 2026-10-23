@@ -9,7 +9,7 @@
 1. 获取 API Key：
    前往阿里云百炼大模型服务平台 (https://bailian.console.aliyun.com/) 注册并获取 API Key。
 2. 配置环境变量：
-   在代码同级目录下创建一个名为 `.env` 的文件，填入你的 Key：
+   在 PyCharm 运行配置里，或者在系统环境变量中配置：
    QWEN_API_KEY=sk-你的真实api-key填在这里
 3. 安装所需依赖库（在终端运行）：
    pip install langchain langchain-openai python-dotenv
