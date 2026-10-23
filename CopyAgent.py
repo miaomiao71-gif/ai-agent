@@ -50,8 +50,9 @@ class SmartCopywriter:
     """智能文案生成器"""
 
     def __init__(self):
-        self.model = ChatOpenAI(
-            model="qwen-flash",
+        self.model = init_chat_model(
+            model="qwen3.8-flash",
+            model_provider="openai",
             base_url=os.getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
             api_key=os.getenv("QWEN_API_KEY"),  # 这里现在能成功读到了
             temperature=0.9,
