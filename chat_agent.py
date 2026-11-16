@@ -10,14 +10,14 @@ load_dotenv()
 
 API_KEY = os.getenv("DASHSCOPE_API_KEY")
 BASE_URL = os.getenv("DASHSCOPE_BASE_URL")
+MODEL_NAME= os.getenv("MODEL_NAME")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL")
+INDEX_PATH = os.getenv("INDEX_PATH")
 
 if not API_KEY or not BASE_URL:
     sys.exit("错误：请在 .env 中设置 DASHSCOPE_API_KEY 和 DASHSCOPE_BASE_URL")
 
 # ================= 配置区 =================
-MODEL_NAME = "qwen3.8-27b"
-EMBEDDING_MODEL = "qwen3.7-text-embedding-flash"
-INDEX_PATH = "./faiss_index"
 SYSTEM_PROMPT = """你是一个专业的知识库问答助手。
 请严格根据提供的参考文档回答用户的问题。
 如果参考文档中找不到答案，请直接回答“根据现有资料无法回答”，绝对不要编造。
@@ -72,11 +72,7 @@ class ChatAgent:
             self.history = [system_msg] + dialog[-max_msgs:]
 
     def send_stream(self, user_input: str):
-        """使用生成器实现流式输出"""
-        # 1. 检索本地向量库
         docs = self.retriever.invoke(user_input)
-
-        # 2. 组装上下文
         if docs:
             context = "\n\n".join([d.page_content for d in docs])
             sources = list(set([os.path.basename(d.metadata.get("source", "未知来源")) for d in docs]))
@@ -89,23 +85,16 @@ class ChatAgent:
         self.history.append(HumanMessage(content=augmented_input))
         self._trim_history()
 
-        # 3. 流式生成
         full_response = ""
-        for chunk in self.model.stream(self.history):
-            content = chunk.content
-            if content:
-                full_response += content
-                yield content  # 逐字吐出
-
-        # 4. 流式结束后，把完整的 AI 回复存入历史记录
-        self.history.append(AIMessage(content=full_response))
-
-        # 5. 最后吐出参考来源
-        if docs:
-            yield f"\n\n[参考来源：{source_text}]"
-        else:
-            yield "\n\n[未在知识库中检索到相关内容]"
-
+        try:
+            for chunk in self.model.stream(self.history):
+                content = chunk.content
+                if content:
+                    full_response += content
+                    yield content
+        finally:
+            if full_response:
+                self.history.append(AIMessage(content=full_response))
 
 def main():
     agent = ChatAgent()

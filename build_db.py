@@ -10,10 +10,10 @@ load_dotenv()
 
 API_KEY = os.getenv("DASHSCOPE_API_KEY")
 BASE_URL = os.getenv("DASHSCOPE_BASE_URL")
-
+MODEL_NAME= os.getenv("MODEL_NAME")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL")
+INDEX_PATH = os.getenv("INDEX_PATH")
 KB_PATH = "./knowledge_base"
-INDEX_PATH = "./faiss_index"
-EMBEDDING_MODEL = "qwen3.7-text-embedding-flash"
 
 
 def build_database():
