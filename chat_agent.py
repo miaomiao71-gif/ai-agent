@@ -1,104 +1,144 @@
-import os
+"""在线问答链路：Query 改写 → 混合检索 → 组装带引用的上下文 → 流式生成。
+
+修复的关键 bug（相比旧版）：
+- 旧版把「参考资料 + 用户问题」拼成的 augmented_input 存入对话历史，
+  导致每轮历史都携带上一轮的检索结果，历史雪球式膨胀且模型会误把旧资料当上下文。
+- 现在：history 只存原始用户输入与模型回答；检索到的资料只在当前轮临时注入模型，
+  不进入历史。Query 改写也只作用于检索词，不污染原始提问。
+
+溯源设计：
+- 每个检索 chunk 分配引用编号 [1][2]…，注入上下文时带上文件名 / 页码 / 块号；
+- 系统提示词要求模型在引用处标注编号，末尾再输出「参考来源」清单（段落级定位）。
+"""
+
 import sys
-from dotenv import load_dotenv
+
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-load_dotenv()
-
-API_KEY = os.getenv("DASHSCOPE_API_KEY")
-BASE_URL = os.getenv("DASHSCOPE_BASE_URL")
-MODEL_NAME= os.getenv("MODEL_NAME")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL")
-INDEX_PATH = os.getenv("INDEX_PATH")
-
-if not API_KEY or not BASE_URL:
-    sys.exit("错误：请在 .env 中设置 DASHSCOPE_API_KEY 和 DASHSCOPE_BASE_URL")
-
-# ================= 配置区 =================
-SYSTEM_PROMPT = """你是一个专业的知识库问答助手。
-请严格根据提供的参考文档回答用户的问题。
-如果参考文档中找不到答案，请直接回答“根据现有资料无法回答”，绝对不要编造。
-回答时，尽量简洁明了。"""
-MAX_TURNS = 10
-TEMPERATURE = 0.1
-# ==========================================
+from config import QUERY_REWRITE_PROMPT, SYSTEM_PROMPT, settings
+from retrieval import HybridRetriever
 
 
 class ChatAgent:
-    def __init__(self):
-        self.model = self.init_model()
-        self.retriever = self.init_retriever()
-        self.history = [SystemMessage(content=SYSTEM_PROMPT)]
+    def __init__(self) -> None:
+        self.model = self._init_model()
+        try:
+            self.retriever = HybridRetriever()
+        except FileNotFoundError as e:
+            sys.exit(f"错误：{e}")
+        # 对话历史只存「原始问答」，绝不放检索到的参考资料
+        self.history: list = [SystemMessage(content=SYSTEM_PROMPT)]
 
-    def init_model(self):
+    def _init_model(self):
         return init_chat_model(
-            MODEL_NAME,
+            settings.chat_model,
             model_provider="openai",
-            base_url=BASE_URL,
-            api_key=API_KEY,
-            temperature=TEMPERATURE,
+            base_url=settings.dashscope_base_url,
+            api_key=settings.dashscope_api_key,
+            temperature=settings.temperature,
         )
 
-    def init_retriever(self):
-        if not os.path.exists(INDEX_PATH):
-            sys.exit(f"错误：找不到向量库 {INDEX_PATH}。请先运行 python build_db.py 构建知识库。")
-
-        print("正在加载本地向量数据库...")
-        embeddings = OpenAIEmbeddings(
-            model=EMBEDDING_MODEL,
-            base_url=BASE_URL,
-            api_key=API_KEY,
-            check_embedding_ctx_length=False
-        )
-
-        vectorstore = FAISS.load_local(
-            INDEX_PATH,
-            embeddings,
-            allow_dangerous_deserialization=True
-        )
-
-        return vectorstore.as_retriever(search_kwargs={"k": 4})
-
-    def _trim_history(self):
-        if MAX_TURNS <= 0:
-            return
-        system_msg = self.history[0]
-        dialog = self.history[1:]
-        max_msgs = MAX_TURNS * 2
+    def _trim_history(self) -> None:
+        """按轮数裁剪历史，保留 system 消息。"""
+        system_msg, dialog = self.history[0], self.history[1:]
+        max_msgs = settings.max_turns * 2
         if len(dialog) > max_msgs:
             self.history = [system_msg] + dialog[-max_msgs:]
 
+    def _recent_dialog_text(self, max_msgs: int = 4) -> str:
+        """取最近若干条对话，拼成给 Query 改写用的文本。"""
+        lines = []
+        for msg in self.history[1:][-max_msgs:]:
+            role = "用户" if isinstance(msg, HumanMessage) else "助手"
+            lines.append(f"{role}：{msg.content}")
+        return "\n".join(lines)
+
+    def rewrite_query(self, user_input: str) -> str:
+        """多轮指代消解：把「它 / 这个 / 上面那个」等补成可独立检索的问题。
+
+        仅在存在多轮对话且开关打开时调用；失败则回退到原始输入，保证可用性。
+        """
+        if not settings.enable_query_rewrite or len(self.history) <= 1:
+            return user_input
+        try:
+            messages = [
+                SystemMessage(content=QUERY_REWRITE_PROMPT),
+                HumanMessage(
+                    content=(
+                        f"对话历史：\n{self._recent_dialog_text()}\n\n"
+                        f"用户最新追问：{user_input}\n\n改写后的问题："
+                    )
+                ),
+            ]
+            resp = self.model.invoke(messages)
+            rewritten = resp.content.strip().strip('"').strip("'")
+            return rewritten or user_input
+        except Exception as e:
+            print(f"[提示] Query 改写失败，使用原始问题：{e}")
+            return user_input
+
+    @staticmethod
+    def _format_context(docs: list) -> tuple[str, list[str]]:
+        """给每个 chunk 编号并附段落级来源，返回（上下文, 来源清单）。"""
+        context_parts: list[str] = []
+        source_lines: list[str] = []
+        for i, doc in enumerate(docs, start=1):
+            meta = doc.metadata
+            page = meta.get("page", -1)
+            location = f"第{page}页" if isinstance(page, int) and page >= 0 else "无页码"
+            source_lines.append(
+                f"  [{i}] {meta.get('file_name', '未知文件')} · {location} · "
+                f"第{meta.get('chunk_index', 0) + 1}段 · "
+                f"相关度 {meta.get('rerank_score', '-')}"
+            )
+            header = (
+                f"[{i}] 来源：{meta.get('file_name', '未知文件')}（{location}，"
+                f"第{meta.get('chunk_index', 0) + 1}段）"
+            )
+            context_parts.append(f"{header}\n{doc.page_content}")
+        return "\n\n".join(context_parts), source_lines
+
     def send_stream(self, user_input: str):
-        docs = self.retriever.invoke(user_input)
+        """流式回答。yield 给用户的内容片段；检索来源通过 self.last_sources 暴露。"""
+        # 1. Query 改写（只用于检索）
+        search_query = self.rewrite_query(user_input)
+        self.last_sources: list[str] = []
+
+        # 2. 混合检索
+        docs = self.retriever.retrieve(search_query)
         if docs:
-            context = "\n\n".join([d.page_content for d in docs])
-            sources = list(set([os.path.basename(d.metadata.get("source", "未知来源")) for d in docs]))
-            source_text = "、".join(sources)
-            augmented_input = f"参考资料：\n{context}\n\n用户问题：{user_input}"
+            context, self.last_sources = self._format_context(docs)
+            augmented_input = (
+                f"参考资料：\n{context}\n\n用户问题：{user_input}"
+            )
         else:
             augmented_input = user_input
-            source_text = "无"
 
-        self.history.append(HumanMessage(content=augmented_input))
-        self._trim_history()
+        # 3. 组装本轮消息：system + 干净历史 + 本轮增强输入
+        #    注意 augmented_input 不写入 self.history，杜绝历史污染
+        turn_messages = (
+            [self.history[0], *self.history[1:], HumanMessage(content=augmented_input)]
+        )
 
         full_response = ""
         try:
-            for chunk in self.model.stream(self.history):
+            for chunk in self.model.stream(turn_messages):
                 content = chunk.content
                 if content:
                     full_response += content
                     yield content
         finally:
+            # 4. 只把原始输入与回答写入历史
             if full_response:
+                self.history.append(HumanMessage(content=user_input))
                 self.history.append(AIMessage(content=full_response))
+                self._trim_history()
 
-def main():
+
+def main() -> None:
     agent = ChatAgent()
-    print("知识库对话助手已启动（流式输出），输入 quit 退出。\n")
+    print("知识库对话助手已启动（混合检索 + Rerank + 流式输出），输入 quit 退出。\n")
     while True:
         try:
             user_input = input("你：").strip()
@@ -114,10 +154,12 @@ def main():
 
         try:
             print("助手：", end="", flush=True)
-            # 接收生成器的内容并实时打印
             for chunk in agent.send_stream(user_input):
                 print(chunk, end="", flush=True)
-            print("\n")  # 对话结束后换行
+            if agent.last_sources:
+                print("\n\n参考来源：")
+                print("\n".join(agent.last_sources))
+            print("\n")
         except Exception as e:
             print(f"\n[请求出错] {e}\n")
 

@@ -5,3 +5,4 @@ __pycache__/
 .idea/
 faiss_index/
 *.log
+.workbuddy
